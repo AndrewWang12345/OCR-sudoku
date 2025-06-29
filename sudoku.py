@@ -25,6 +25,39 @@ TEST_DATA_FILENAME = DATA_DIRECTORY + 't10k-images.idx3-ubyte'
 TEST_LABELS_FILENAME = DATA_DIRECTORY + 't10k-labels.idx1-ubyte'
 TRAIN_DATA_FILENAME = DATA_DIRECTORY + 'train-images.idx3-ubyte'
 TRAIN_LABELS_FILENAME = DATA_DIRECTORY + 'train-labels.idx1-ubyte'
+def is_valid(board, row, col, num):
+    # Check row
+    if any(board[row][c] == num for c in range(9)):
+        return False
+    # Check column
+    if any(board[r][col] == num for r in range(9)):
+        return False
+    # Check 3x3 box
+    box_row_start = (row // 3) * 3
+    box_col_start = (col // 3) * 3
+    for r in range(box_row_start, box_row_start + 3):
+        for c in range(box_col_start, box_col_start + 3):
+            if board[r][c] == num:
+                return False
+    return True
+
+def solve_sudoku(board):
+    for row in range(9):
+        for col in range(9):
+            if board[row][col] == 0:
+                for num in range(1, 10):
+                    if is_valid(board, row, col, num):
+                        board[row][col] = num
+                        if solve_sudoku(board):
+                            return True
+                        board[row][col] = 0
+                return False  # No valid number found, backtrack
+    return True  # Solved
+
+def print_board(board):
+    for row in board:
+        print(" ".join(str(num) for num in row))
+
 def gpu_morphology_close(gray, kernel):
     height, width = gray.shape
 
@@ -120,23 +153,12 @@ def knn(X_train, Y_train, X_test, k=9):
 
 
 def main():
-    print("thresh")
     image = cv2.imread('sudoku.png')
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     # Create elliptical kernel same as OpenCV uses for comparison
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)).astype(np.uint8)
-
-    start = time.perf_counter()
-    # Run your CPU code here, e.g. OpenCV morphologyEx
-    result = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-    end = time.perf_counter()
-    print(f"CPU morphologyEx time: {1000 * (end - start):.3f} ms")
-
-    start = time.perf_counter()
     close = gpu_morphology_close(gray, kernel)
-    end = time.perf_counter()
-    print(f"GPU morphology close time (dilation + erosion): {1000 * (end - start):.3f} ms")
 
     div = numpy.float32(gray) / (close)
     res = numpy.uint8(cv2.normalize(div, div, 0, 255, cv2.NORM_MINMAX))
@@ -198,7 +220,6 @@ def main():
     # Use warped image for further processing
     # Finding horizontal lines
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
-    print("sobel")
     dx = cv2.Sobel(warped, cv2.CV_16S, 0, 1)
     dx = cv2.convertScaleAbs(dx)
     ret, dx = cv2.threshold(dx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -250,7 +271,6 @@ def main():
 
     # Sort the grid points vertically, then horizontally
     gridPoints = sorted(gridPoints, key=lambda x: x[1])
-    print(f"Detected grid points: {len(gridPoints)}")
     gridPoints2D = numpy.zeros((10, 10, 2))
     for i in range(10):
         row_points = gridPoints[10 * i:10 * (i + 1)]
@@ -297,11 +317,9 @@ def main():
     for i in range(len(X_test)):
         for j in range(len(X_test[i])):
             X_test[i][j] = 0 if X_test[i][j] <= 200 else 255
-    print("loading data")
     # Load training data and labels
     X_train = read_images(TRAIN_DATA_FILENAME)
     Y_train = read_labels(TRAIN_LABELS_FILENAME)
-    print(len(X_train))
     predictions = knn(X_train, Y_train, X_test, 9)
 
     # Format predictions as 9x9 grid
@@ -309,6 +327,15 @@ def main():
     for i in range(9):
         row = predictions[i * 9:(i + 1) * 9]
         print(" ".join(str(d) for d in row))
+
+    # Convert predictions (list) to 9x9 grid (list of lists of ints)
+    sudoku_grid = [predictions[i * 9:(i + 1) * 9] for i in range(9)]
+
+    if solve_sudoku(sudoku_grid):
+        print("\nSolved Sudoku Grid:")
+        print_board(sudoku_grid)
+    else:
+        print("Unsolvable")
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
