@@ -1,7 +1,22 @@
 import cv2
 import numpy
+import pycuda.autoinit
+import pycuda.driver as cuda
+from pycuda.compiler import SourceModule
+import numpy as np
 from collections import Counter
+import time
+# Read CUDA kernel source
+with open("kernels.cu", "r") as f:
+    kernel_code = f.read()
 
+# Compile with PyCUDA
+mod = SourceModule(kernel_code)
+
+# Get function references
+morphology_dilation = mod.get_function("morphology_dilation")
+morphology_erosion = mod.get_function("morphology_erosion")
+knn_distance = mod.get_function("knn_distance")
 # Press Shift+F10 to execute it or replace it with your code.
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 
@@ -10,74 +25,121 @@ TEST_DATA_FILENAME = DATA_DIRECTORY + 't10k-images.idx3-ubyte'
 TEST_LABELS_FILENAME = DATA_DIRECTORY + 't10k-labels.idx1-ubyte'
 TRAIN_DATA_FILENAME = DATA_DIRECTORY + 'train-images.idx3-ubyte'
 TRAIN_LABELS_FILENAME = DATA_DIRECTORY + 'train-labels.idx1-ubyte'
+def gpu_morphology_close(gray, kernel):
+    height, width = gray.shape
 
+    # Flatten and copy kernel mask to constant memory
+    mask_flat = kernel.flatten().astype(np.uint8)
+    d_mask, _ = mod.get_global('d_mask')
+    cuda.memcpy_htod(d_mask, mask_flat)
+
+    # Allocate GPU buffers
+    input_gpu = cuda.mem_alloc(gray.nbytes)
+    dilated_gpu = cuda.mem_alloc(gray.nbytes)
+    eroded_gpu = cuda.mem_alloc(gray.nbytes)
+
+    cuda.memcpy_htod(input_gpu, gray)
+
+    block_size = (16, 16, 1)
+    grid_size = ((width + 15) // 16, (height + 15) // 16, 1)
+
+    # Run dilation
+    morphology_dilation(input_gpu, dilated_gpu, np.int32(width), np.int32(height), block=block_size, grid=grid_size)
+
+    # Run erosion on dilated image (closing)
+    morphology_erosion(dilated_gpu, eroded_gpu, np.int32(width), np.int32(height), block=block_size, grid=grid_size)
+
+    # Copy result back to CPU
+    gpu_closed = np.empty_like(gray)
+    cuda.memcpy_dtoh(gpu_closed, eroded_gpu)
+
+    return gpu_closed
 def read_images(filename):
-    images = []
     with open(filename, 'rb') as f:
-        _ = f.read(4)
-        n_images = int.from_bytes(f.read(4), 'big')
-        n_rows = int.from_bytes(f.read(4), 'big')
-        n_columns = int.from_bytes(f.read(4), 'big')
-        for image_index in range(10000):
-
-            image = []
-            for row_index in range(n_rows*n_columns):
-                pixel = int.from_bytes(f.read(1), "big")
-                #print(pixel)
-                # if pixel != 0:
-                #     pixel = 255
-                image.append(pixel)
-            images.append(image)
-        return images
+        f.read(16)  # skip the header
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+        images = data.reshape(-1, 28 * 28)
+    return images
 
 def read_labels(filename):
-    labels = []
     with open(filename, 'rb') as f:
-        _ = f.read(4)
-        n_labels = int.from_bytes(f.read(4), 'big')
-        for label_index in range(10000):
-            #print("a")
-            label = int.from_bytes(f.read(1), "big")
-            labels.append(label)
-        return labels
+        f.read(8)  # skip the header
+        labels = np.frombuffer(f.read(), dtype=np.uint8)
+    return labels
 
 def distance(x, y):
     #print(sum([(int.from_bytes(x_i, 'big') - int.from_bytes(y_i, 'big')) ** 2 for x_i, y_i in zip(x, y)]))
-    return sum([(x_i - y_i) ** 2 for x_i, y_i in zip(x, y)]) ** 0.5
+    return sum([(x_i - y_i) ** 2 for x_i, y_i in zip(x, y)])
 
 def get_training_distances_for_test_sample(X_train, test_sample):
     return[distance(train_sample, test_sample) for train_sample in X_train]
 
-
-from collections import Counter
-
+# [6005030.0, 6815366.0, 3918958.0, 3862798.0, 5088761.0, 6339780.0, 4070545.0, 8058638.0, 2386239.0, 4691529.0]
+#  [5585555.0, 7660181.0, 7166893.0, 6652243.0, 6138596.0, 6726105.0, 6611110.0, 6609983.0, 6030444.0, 6747594.0]
 
 def knn(X_train, Y_train, X_test, k=9):
     Y_pred = []
-    for test_sample_index, test_sample in enumerate(X_test):
-        if numpy.count_nonzero(test_sample) < 50:  # skip mostly empty cells
+
+    # Convert data to float32 numpy arrays
+    X_train = np.array(X_train, dtype=np.float32)
+    X_test = np.array(X_test, dtype=np.float32)
+    distances = np.zeros((len(X_test), len(X_train)), dtype=np.float32)
+
+    # Allocate GPU memory
+    d_X_train = cuda.mem_alloc(X_train.nbytes)
+    d_X_test = cuda.mem_alloc(X_test.nbytes)
+    d_distances = cuda.mem_alloc(distances.nbytes)
+
+    # Copy to GPU
+    cuda.memcpy_htod(d_X_train, X_train)
+    cuda.memcpy_htod(d_X_test, X_test)
+
+    # Set launch config
+    block_size = (16, 16, 1)
+    grid_y = (len(X_test) + 15) // 16
+    grid_x = (len(X_train) + 15) // 16
+    # Call CUDA kernel
+    knn_distance(d_X_train, d_X_test, d_distances,
+                 np.int32(len(X_train)), np.int32(len(X_test)), np.int32(X_train.shape[1]),
+                 block=block_size, grid=(grid_x, grid_y))
+
+    # Copy distances back
+    cuda.memcpy_dtoh(distances, d_distances)
+    # Do the top-k voting on CPU
+    for test_sample_index in range(len(X_test)):
+        if np.count_nonzero(X_test[test_sample_index]) < 70:
             Y_pred.append(0)
             continue
-        training_distances = get_training_distances_for_test_sample(X_train, test_sample)
-        sorted_distance_indices = sorted(range(len(training_distances)), key=lambda i: training_distances[i])
-        candidates = [Y_train[i] for i in sorted_distance_indices[:k]]
 
+        dist_row = distances[test_sample_index]
+        sorted_indices = np.argsort(dist_row)[:k]
+        candidates = [Y_train[i] for i in sorted_indices[:k]]
         most_common = Counter(candidates).most_common(1)[0][0]
         Y_pred.append(most_common)
-
-        print(f'Cell {test_sample_index}: Predicted = {most_common}, Nearest = {candidates}')
     return Y_pred
 
 
 def main():
+    print("thresh")
     image = cv2.imread('sudoku.png')
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mask = numpy.zeros((gray.shape), numpy.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    close = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
+    # Create elliptical kernel same as OpenCV uses for comparison
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)).astype(np.uint8)
+
+    start = time.perf_counter()
+    # Run your CPU code here, e.g. OpenCV morphologyEx
+    result = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    end = time.perf_counter()
+    print(f"CPU morphologyEx time: {1000 * (end - start):.3f} ms")
+
+    start = time.perf_counter()
+    close = gpu_morphology_close(gray, kernel)
+    end = time.perf_counter()
+    print(f"GPU morphology close time (dilation + erosion): {1000 * (end - start):.3f} ms")
+
     div = numpy.float32(gray) / (close)
     res = numpy.uint8(cv2.normalize(div, div, 0, 255, cv2.NORM_MINMAX))
-
     # Finding the sudoku square contour
     thresh = cv2.adaptiveThreshold(res, 255, 0, 1, 19, 2)
     contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -136,6 +198,7 @@ def main():
     # Use warped image for further processing
     # Finding horizontal lines
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
+    print("sobel")
     dx = cv2.Sobel(warped, cv2.CV_16S, 0, 1)
     dx = cv2.convertScaleAbs(dx)
     ret, dx = cv2.threshold(dx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -218,12 +281,12 @@ def main():
     for i in range(len(image_array)):
         image_array[i] = cv2.morphologyEx(image_array[i], cv2.MORPH_CLOSE, kernel, iterations=1)
         # Then crop margins a bit less aggressively
-        image_array[i] = image_array[i][10:290, 10:290]
+        image_array[i] = image_array[i][50:250, 50:250]
         image_array[i] = cv2.resize(image_array[i], (28, 28))
 
     # # Display each cell (optional)
     # for idx, img in enumerate(image_array):
-    #     cv2.imshow(f'Cell {idx}', img)
+    #     cv2.imshow(f'Cell {idx}', cv2.resize(img, (280, 280)))
     #     cv2.waitKey(0)
     #     cv2.destroyAllWindows()
 
@@ -234,11 +297,11 @@ def main():
     for i in range(len(X_test)):
         for j in range(len(X_test[i])):
             X_test[i][j] = 0 if X_test[i][j] <= 200 else 255
-
+    print("loading data")
     # Load training data and labels
     X_train = read_images(TRAIN_DATA_FILENAME)
     Y_train = read_labels(TRAIN_LABELS_FILENAME)
-
+    print(len(X_train))
     predictions = knn(X_train, Y_train, X_test, 9)
 
     # Format predictions as 9x9 grid
